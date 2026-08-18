@@ -242,7 +242,7 @@ unflagged from 22.18 onward.)
 git clone https://github.com/adoodevv/reservation-service.git
 cd reservation-service
 
-cp .env.example .env   # required: the npm scripts read it via --env-file
+cp .env.example .env   # or export DATABASE_URL yourself -- see note below
 npm install
 npm run db:up          # Postgres 17 in Docker on :5433, waits until it answers
 npm run db:migrate
@@ -251,6 +251,10 @@ npm start              # http://localhost:3000
 
 Nothing listens on 5432, so this will not collide with a Postgres you already
 run locally. `npm run db:reset` tears the volume down and rebuilds from scratch.
+
+The npm scripts load `.env` *if it exists* (`--env-file-if-exists`) and
+otherwise fall back to the ambient environment, so the same commands work
+locally with a file and in CI or a container with plain environment variables.
 
 ```bash
 npm test               # full suite, including the concurrency stampedes (~15s)
@@ -264,10 +268,10 @@ harder:
 
 ```bash
 # Reproduce the table above (several minutes -- `serializable` dominates it).
-node --env-file=.env bench/loadtest.ts --attempts 3000 --units 200
+node --env-file-if-exists=.env bench/loadtest.ts --attempts 3000 --units 200
 
 # The headline comparison on its own, in a few seconds.
-node --env-file=.env bench/loadtest.ts --strategies optimistic,naive
+node --env-file-if-exists=.env bench/loadtest.ts --strategies optimistic,naive
 ```
 
 It exits non-zero if any double-booking, oversell, or unexplained error shows

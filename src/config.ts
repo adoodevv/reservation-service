@@ -17,7 +17,9 @@ function required(name: string): string {
    const value = process.env[name];
    if (!value) {
       throw new Error(
-         `Missing required environment variable ${name}. Copy .env.example to .env.`,
+         `Missing required environment variable ${name}. ` +
+            `Either copy .env.example to .env, or export it directly ` +
+            `(the npm scripts load .env only if it exists, so both work).`,
       );
    }
    return value;
