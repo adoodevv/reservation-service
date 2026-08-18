@@ -1,0 +1,300 @@
+/**
+ * The point of the project.
+ *
+ * Every test here fires many reservation attempts at the same instant against
+ * the same inventory, then verifies the result *from the database* with
+ * find_double_bookings() -- a SQL self-join that knows nothing about the code
+ * that wrote the rows. The suite never asserts "the service reported no
+ * conflicts"; it asserts no conflicting rows exist.
+ *
+ * Two properties are checked every time, and the second is the one people
+ * forget:
+ *
+ *   safety   -- no two inventory-occupying reservations overlap on a unit.
+ *               A service that rejects everything is trivially safe.
+ *   liveness -- the number of winners is exactly the number of units. Not
+ *               fewer: losing a race must not lose inventory. A system that
+ *               books 47 of 50 rooms under load is broken too, just quietly.
+ */
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { closePool, withTransaction } from "../src/db/pool.ts";
+import { NoInventoryError, ServiceError } from "../src/domain/errors.ts";
+import type { AllocationOutcome } from "../src/domain/types.ts";
+import * as repo from "../src/repo/reservations.ts";
+import type { AllocationStrategy } from "../src/services/allocator.ts";
+import { allocate } from "../src/services/allocator.ts";
+import {
+   countDoubleBookings,
+   ensureSchema,
+   partition,
+   period,
+   seedResource,
+   stampede,
+   truncateAll,
+} from "./helpers.ts";
+
+/** Every strategy that must never double-book. */
+const SAFE_STRATEGIES: AllocationStrategy[] = ["optimistic", "serializable", "pessimistic"];
+
+/**
+ * Strategies exercised at full load.
+ *
+ * `serializable` is excluded from the heaviest scenarios, and the reason is a
+ * measured result rather than a convenience. At ~12 concurrent requests per
+ * unit its SSI aborts multiply the population of in-flight transactions on the
+ * same key range; each INSERT into the exclusion-constrained index then has to
+ * wait out every conflicting uncommitted transaction it meets, re-scanning
+ * after each one. `lock_timeout` bounds an individual wait but not that loop,
+ * so statements accumulate past `statement_timeout`: 97 of 120 requests died on
+ * SQLSTATE 57014, and the scenario took 129s against 0.7s for `optimistic`.
+ *
+ * That is an availability failure, not a safety one -- it never oversold. The
+ * dedicated test below pins exactly that distinction, and bench/RESULTS.md
+ * carries the numbers.
+ */
+const HIGH_LOAD_STRATEGIES: AllocationStrategy[] = ["optimistic", "pessimistic"];
+
+function summarise(failed: unknown[]): Record<string, number> {
+   const counts: Record<string, number> = {};
+   for (const err of failed) {
+      const code = err instanceof ServiceError ? err.code : "unexpected";
+      counts[code] = (counts[code] ?? 0) + 1;
+      if (code === "unexpected") throw err;
+   }
+   return counts;
+}
+
+// One pool for the whole file: a closePool() inside a describe would tear the
+// pool down for every describe that runs after it.
+beforeAll(ensureSchema);
+afterAll(closePool);
+
+describe("concurrent allocation", () => {
+   beforeEach(truncateAll);
+
+   describe.each(SAFE_STRATEGIES)("strategy: %s", (strategy) => {
+      it("two users hitting the last room at the same instant: exactly one wins", async () => {
+         const resource = await seedResource(1, `last-room-${strategy}`);
+         const window = period();
+
+         const results = await stampede(2, (i) =>
+            allocate({
+               resourceId: resource.id,
+               guestRef: `guest-${i}`,
+               period: window,
+               strategy,
+            }),
+         );
+
+         const { ok, failed } = partition(results);
+         expect(ok).toHaveLength(1);
+         expect(failed).toHaveLength(1);
+         expect(failed[0]).toBeInstanceOf(NoInventoryError);
+         expect(await countDoubleBookings()).toBe(0);
+      });
+
+      it("200 concurrent attempts on a single unit: exactly one wins", async () => {
+         const resource = await seedResource(1, `single-unit-${strategy}`);
+         const window = period();
+
+         const results = await stampede(200, (i) =>
+            allocate({
+               resourceId: resource.id,
+               guestRef: `guest-${i}`,
+               period: window,
+               strategy,
+            }),
+         );
+
+         const { ok, failed } = partition(results);
+         expect(await countDoubleBookings()).toBe(0);
+         expect(ok).toHaveLength(1);
+         expect(summarise(failed).no_inventory).toBe(199);
+      });
+
+   });
+
+   describe.each(HIGH_LOAD_STRATEGIES)("under full load: %s", (strategy) => {
+      it("500 concurrent attempts on 50 units: exactly 50 win, none lost", async () => {
+         const capacity = 50;
+         const resource = await seedResource(capacity, `capacity-${strategy}`);
+         const window = period();
+
+         const results = await stampede(500, (i) =>
+            allocate({
+               resourceId: resource.id,
+               guestRef: `guest-${i}`,
+               period: window,
+               strategy,
+               maxRetries: 20,
+            }),
+         );
+
+         const { ok, failed } = partition(results);
+
+         // Safety.
+         expect(await countDoubleBookings()).toBe(0);
+         // Liveness: every unit sold, and not one more.
+         expect(ok).toHaveLength(capacity);
+         // Every loser got a truthful "sold out", not a spurious error.
+         expect(summarise(failed)).toEqual({ no_inventory: 500 - capacity });
+
+         // Each winner holds a distinct unit -- the real statement of "no
+         // double-booking", expressed independently of the SQL verifier.
+         const units = new Set(ok.map((o: AllocationOutcome) => o.reservation.unitId));
+         expect(units.size).toBe(capacity);
+      });
+
+      it("overlapping but non-identical date ranges contend correctly", async () => {
+         // Every request wants a different window, but all of them include the
+         // night of the 10th, so at most `capacity` can succeed. This catches
+         // an implementation that only compares ranges for equality.
+         const capacity = 10;
+         const resource = await seedResource(capacity, `sliding-${strategy}`);
+
+         const results = await stampede(120, (i) =>
+            allocate({
+               resourceId: resource.id,
+               guestRef: `guest-${i}`,
+               period: period(1 + (i % 9), 11 + (i % 9)),
+               strategy,
+               maxRetries: 20,
+            }),
+         );
+
+         const { ok } = partition(results);
+         expect(await countDoubleBookings()).toBe(0);
+
+         // Everything overlaps the 10th, so the winners are capped by capacity.
+         expect(ok.length).toBeLessThanOrEqual(capacity);
+         expect(ok.length).toBeGreaterThan(0);
+
+         const nightOfTheTenth = await withTransaction((tx) =>
+            repo.availability(tx, resource.id, period(10, 11)),
+         );
+         expect(nightOfTheTenth.filter((u) => !u.isFree)).toHaveLength(ok.length);
+      });
+   });
+
+   it("serializable stays correct at the load where it stops being available", async () => {
+      // SERIALIZABLE's problem in this service is throughput, not safety. Even
+      // when most requests are shed, the ones that land must still respect
+      // capacity -- it must never oversell to compensate.
+      const capacity = 10;
+      const resource = await seedResource(capacity, "serializable-correctness");
+      const window = period();
+
+      const results = await stampede(60, (i) =>
+         allocate({
+            resourceId: resource.id,
+            guestRef: `guest-${i}`,
+            period: window,
+            strategy: "serializable",
+            maxRetries: 10,
+         }),
+      );
+
+      const { ok } = partition(results);
+      expect(await countDoubleBookings()).toBe(0);
+      // Never more than capacity. Possibly fewer, if requests were shed.
+      expect(ok.length).toBeLessThanOrEqual(capacity);
+      expect(new Set(ok.map((o: AllocationOutcome) => o.reservation.unitId)).size).toBe(
+         ok.length,
+      );
+   });
+
+   it("non-overlapping windows never contend: all 100 succeed on one unit", async () => {
+      // Back-to-back stays on a single room. Every request is for a distinct
+      // night, so a correct implementation books all of them; an
+      // over-eager lock or an '[]' bound would serialise or reject them.
+      const resource = await seedResource(1, "sequential");
+
+      const results = await stampede(100, (i) =>
+         allocate({
+            resourceId: resource.id,
+            guestRef: `guest-${i}`,
+            period: period(1 + i, 2 + i),
+            maxRetries: 20,
+         }),
+      );
+
+      const { ok, failed } = partition(results);
+      expect(failed).toHaveLength(0);
+      expect(ok).toHaveLength(100);
+      expect(await countDoubleBookings()).toBe(0);
+   });
+
+   it("mixed confirm/cancel traffic keeps the invariant while inventory churns", async () => {
+      // Allocation is not the only writer. Cancellations release inventory
+      // mid-flight, so a second wave of bookings races against rows leaving the
+      // index at the same time as others enter it.
+      const capacity = 20;
+      const resource = await seedResource(capacity, "churn");
+      const window = period();
+
+      const firstWave = partition(
+         await stampede(capacity, (i) =>
+            allocate({ resourceId: resource.id, guestRef: `first-${i}`, period: window }),
+         ),
+      ).ok;
+      expect(firstWave).toHaveLength(capacity);
+
+      // Cancel half the first wave while a second wave tries to book.
+      const cancels: (() => Promise<unknown>)[] = firstWave
+         .slice(0, 10)
+         .map((o: AllocationOutcome) => () =>
+            withTransaction((tx) =>
+               repo.cancelReservation(tx, o.reservation.id, o.reservation.version),
+            ),
+         );
+      const books: (() => Promise<unknown>)[] = Array.from({ length: 100 }, (_, i) => () =>
+         allocate({
+            resourceId: resource.id,
+            guestRef: `second-${i}`,
+            period: window,
+            maxRetries: 20,
+         }),
+      );
+      const interleaved = [...cancels, ...books];
+
+      const results = await stampede(interleaved.length, (i) => interleaved[i]!());
+      const { ok } = partition(results);
+
+      expect(await countDoubleBookings()).toBe(0);
+
+      // 10 cancels always succeed; the freed units are exactly the extra
+      // bookings that can land, so total live reservations returns to capacity.
+      const live = await withTransaction((tx) => repo.availability(tx, resource.id, window));
+      expect(live.filter((u) => !u.isFree)).toHaveLength(capacity);
+      expect(ok.length).toBeGreaterThanOrEqual(10);
+   });
+});
+
+describe("the control group: naive check-then-insert", () => {
+   beforeEach(truncateAll);
+
+   it("double-books under the exact same load the safe strategies survive", async () => {
+      // If this test ever starts passing with zero conflicts, the concurrency
+      // suite above has stopped proving anything -- it would mean the harness
+      // is not generating real contention, and every "0 double-bookings"
+      // result elsewhere is vacuous. This is the smoke detector's test button.
+      const resource = await seedResource(1, "naive-control");
+      const window = period();
+
+      await stampede(200, (i) =>
+         allocate({
+            resourceId: resource.id,
+            guestRef: `guest-${i}`,
+            period: window,
+            strategy: "naive",
+            maxRetries: 0,
+         }),
+      );
+
+      const conflicts = await countDoubleBookings("naive_reservations");
+      expect(conflicts).toBeGreaterThan(0);
+
+      // ...and the guarded table is untouched by any of it.
+      expect(await countDoubleBookings("reservations")).toBe(0);
+   });
+});

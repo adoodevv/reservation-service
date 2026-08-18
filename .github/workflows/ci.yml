@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: reservations
+          POSTGRES_PASSWORD: reservations
+          POSTGRES_DB: reservations
+        ports:
+          - 5433:5432
+        # The concurrency suites open a lot of sessions at once.
+        options: >-
+          --health-cmd "pg_isready -U reservations -d reservations"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+          --tmpfs /var/lib/postgresql/data
+
+    env:
+      DATABASE_URL: postgres://reservations:reservations@localhost:5433/reservations
+      PG_POOL_MAX: 32
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run db:migrate
+
+      # The full suite, including the stampedes. A regression that reintroduces
+      # a race fails the build rather than being noticed in production.
+      - run: npm test
+
+      # A smaller load run than the README's, sized to finish on a CI runner
+      # while still asserting zero double-bookings. `serializable` is left out
+      # here purely for wall time -- it dominates a full sweep under contention
+      # and its correctness is already covered by the test suite above.
+      - run: >-
+          node bench/loadtest.ts
+          --attempts 800 --units 50 --seed-resources 400
+          --strategies optimistic,pessimistic,naive

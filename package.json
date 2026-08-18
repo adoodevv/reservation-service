@@ -1,0 +1,32 @@
+{
+  "name": "reservation-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Concurrent booking / inventory reservation service that provably never double-books.",
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "db:up": "docker compose up -d && node --env-file=.env scripts/wait-for-db.js",
+    "db:down": "docker compose down -v",
+    "db:migrate": "node --env-file=.env src/db/migrate.ts",
+    "db:reset": "npm run db:down && npm run db:up && npm run db:migrate",
+    "dev": "node --env-file=.env --watch src/index.ts",
+    "start": "node --env-file=.env src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "node --env-file=.env bench/loadtest.ts",
+    "report": "node --env-file=.env bench/loadtest.ts --write-report"
+  },
+  "dependencies": {
+    "fastify": "^5.2.1",
+    "pg": "^8.13.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

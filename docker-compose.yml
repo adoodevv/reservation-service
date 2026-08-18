@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: reservations-pg
+    environment:
+      POSTGRES_USER: reservations
+      POSTGRES_PASSWORD: reservations
+      POSTGRES_DB: reservations
+    ports:
+      - "5433:5432"
+    command:
+      # The load harness opens a lot of sessions; the default 100 is not enough
+      # headroom to distinguish "we ran out of connections" from "we lost a race".
+      - "postgres"
+      - "-c"
+      - "max_connections=300"
+      - "-c"
+      - "log_lock_waits=on"
+      - "-c"
+      - "deadlock_timeout=200ms"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reservations -d reservations"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      # Benchmarks should measure lock contention, not laptop disk fsync latency.
+      - /var/lib/postgresql/data
