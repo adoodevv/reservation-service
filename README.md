@@ -1,5 +1,7 @@
 # reservation-service
 
+[![CI](https://github.com/adoodevv/reservation-service/actions/workflows/ci.yml/badge.svg)](https://github.com/adoodevv/reservation-service/actions/workflows/ci.yml)
+
 A standalone booking service for a finite resource over date ranges, built so that
 **two users hitting "book" on the last room at the same millisecond cannot both win** —
 and built to prove it rather than assert it.
