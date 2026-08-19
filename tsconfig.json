@@ -16,5 +16,8 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "bench/**/*.ts", "scripts/**/*.js"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "bench/**/*.ts", "scripts/**/*.js"],
+  // Local stress-test scratch files. Git ignores them, but tsc walks the
+  // filesystem rather than the index, so it needs telling separately.
+  "exclude": ["bench/_scratch/**"]
 }
