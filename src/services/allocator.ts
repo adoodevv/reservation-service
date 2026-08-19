@@ -38,6 +38,7 @@ import {
    NoInventoryError,
    isExclusionViolation,
    isLockTimeout,
+   isOverloadError,
    isRetryableTransactionError,
 } from "../domain/errors.ts";
 import type { AllocationOutcome, Period, Reservation } from "../domain/types.ts";
@@ -65,6 +66,8 @@ interface AttemptTally {
    exclusionConflicts: number;
    serializationFailures: number;
    reclaimedHolds: number;
+   /** Unit the in-flight attempt targeted, so a conflict knows what to exclude. */
+   lastUnitId?: string;
 }
 
 /**
@@ -130,8 +133,28 @@ async function attemptAllocation(
    tally: AttemptTally,
    order: CandidateOrder,
    attemptIndex: number,
+   collided: Set<string>,
 ): Promise<Reservation | null> {
-   let candidates = await repo.findFreeUnits(tx, request.resourceId, request.period, order);
+   let candidates = await repo.findFreeUnits(
+      tx,
+      request.resourceId,
+      request.period,
+      order,
+      [...collided],
+   );
+
+   // Running out of *non-excluded* candidates says nothing about inventory.
+   // Exclusions are a convergence heuristic built from conflicts, and a
+   // conflict can be transient: the transaction that beat us may since have
+   // rolled back, or its hold may have expired. Concluding "sold out" from an
+   // empty filtered list would report a sell-out that never happened -- with
+   // one unit and two contending requests, it loses the booking entirely.
+   //
+   // So when the filter empties the list, drop it and look at reality.
+   if (candidates.length === 0 && collided.size > 0) {
+      collided.clear();
+      candidates = await repo.findFreeUnits(tx, request.resourceId, request.period, order);
+   }
 
    // Reclaiming expired holds only matters when we are otherwise about to
    // report "sold out", so it runs on the slow path only. That ordering is not
@@ -155,6 +178,7 @@ async function attemptAllocation(
    // Rotate the starting offset by attempt number so a retry does not
    // immediately re-pick the unit that just rejected us.
    const unitId = candidates[attemptIndex % candidates.length]!;
+   tally.lastUnitId = unitId;
 
    return repo.insertHold(tx, {
       unitId,
@@ -258,6 +282,13 @@ export async function allocate(request: AllocateRequest): Promise<AllocationOutc
       reclaimedHolds: 0,
    };
 
+   // Units this call has already lost a race for. A conflict proves the unit is
+   // taken by a transaction READ COMMITTED cannot show us, so re-offering it
+   // burns a retry on a known-dead candidate. Excluding them makes the loop
+   // converge -- each attempt narrows the search -- instead of resampling
+   // contested inventory at random until the budget runs out.
+   const collided = new Set<string>();
+
    const isolation: IsolationLevel =
       strategy === "serializable" ? "serializable" : "read committed";
 
@@ -276,7 +307,7 @@ export async function allocate(request: AllocateRequest): Promise<AllocationOutc
                // because there is exactly one lock per allocation.
                await repo.lockResourceForAllocation(tx, request.resourceId);
             }
-            return attemptAllocation(tx, request, tally, order, attempt);
+            return attemptAllocation(tx, request, tally, order, attempt, collided);
          }, isolation, LOCK_TIMEOUT_MS);
 
          if (reservation === null) {
@@ -311,6 +342,8 @@ export async function allocate(request: AllocateRequest): Promise<AllocationOutc
             // and on the next pass we pick a different candidate unit.
             tally.exclusionConflicts++;
             increment("allocation.lock_timeout");
+            // Timing out on this key range means someone is mid-insert on it.
+            if (tally.lastUnitId) collided.add(tally.lastUnitId);
             ceiling = CONFLICT_BACKOFF_CEILING_MS;
          } else if (isExclusionViolation(err)) {
             // Another transaction inserted an overlapping row on the unit we
@@ -318,10 +351,27 @@ export async function allocate(request: AllocateRequest): Promise<AllocationOutc
             // preventing a double-booking, observed from the losing side.
             tally.exclusionConflicts++;
             increment("allocation.exclusion_conflict");
+            // The constraint rejected us: that unit is definitively taken.
+            if (tally.lastUnitId) collided.add(tally.lastUnitId);
             ceiling = CONFLICT_BACKOFF_CEILING_MS;
          } else if (isRetryableTransactionError(err)) {
             tally.serializationFailures++;
             increment("allocation.serialization_failure");
+            // Deliberately no exclusion. A serialization failure means the
+            // transactions could not be ordered -- it is not evidence about
+            // the unit, which may well still be free.
+            ceiling = SERIALIZATION_BACKOFF_CEILING_MS;
+         } else if (isOverloadError(err)) {
+            // statement_timeout or predicate-lock exhaustion: the server ran
+            // out of time or memory for our statement. Nothing was written, so
+            // this is safe to retry -- and it must be handled here, because an
+            // uncaught overload error reaches the client as a 500 when the
+            // truthful answer is "sold out" or "overloaded, try again".
+            //
+            // Backed off hard: the system is already past capacity, and a tight
+            // retry is precisely what it cannot absorb.
+            tally.serializationFailures++;
+            increment("allocation.overload");
             ceiling = SERIALIZATION_BACKOFF_CEILING_MS;
          } else {
             throw err;
@@ -331,11 +381,50 @@ export async function allocate(request: AllocateRequest): Promise<AllocationOutc
       }
    }
 
-   increment("allocation.exhausted_retries");
+   // The retry budget is gone, but "I kept losing races" and "there is nothing
+   // left to win" are different answers deserving different status codes, and
+   // the loop above cannot tell them apart: it works from an exclusion set and
+   // from snapshots that could not see uncommitted winners.
+   //
+   // So ask once, authoritatively, with no exclusions and after reclaiming any
+   // expired holds. By now the transactions we lost to have committed, so this
+   // sees the true state. Returning 503 "retry" to a caller facing a sold-out
+   // resource is the worst possible answer -- it invites more load at exactly
+   // the moment the system has none to give.
+   let freeUnits: number;
+   try {
+      freeUnits = await withTransaction(async (tx) => {
+         await repo.reclaimExpiredHolds(tx, request.resourceId, request.period);
+         return repo.countFreeUnits(tx, request.resourceId, request.period);
+      });
+   } catch (err) {
+      // If even this check cannot run, the server is saturated. Say so, rather
+      // than guessing at inventory we failed to read.
+      if (!isOverloadError(err)) throw err;
+      increment("allocation.exhausted_retries");
+      throw new ExhaustedRetriesError(tally.attempts, {
+         resourceId: request.resourceId,
+         reason: "server overloaded; inventory state could not be confirmed",
+      });
+   }
+
    observe("allocation.latency_ms", performance.now() - startedAt);
+
+   if (freeUnits === 0) {
+      increment("allocation.no_inventory");
+      throw new NoInventoryError({
+         resourceId: request.resourceId,
+         from: request.period.from.toISOString(),
+         to: request.period.to.toISOString(),
+         contendedAttempts: tally.attempts,
+      });
+   }
+
+   increment("allocation.exhausted_retries");
    throw new ExhaustedRetriesError(tally.attempts, {
       resourceId: request.resourceId,
       exclusionConflicts: tally.exclusionConflicts,
       serializationFailures: tally.serializationFailures,
+      freeUnits,
    });
 }
