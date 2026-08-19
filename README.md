@@ -284,20 +284,42 @@ the smoke detector's test button.
 
 ## Running it
 
+### Everything in one command
+
+```bash
+git clone https://github.com/adoodevv/reservation-service.git
+cd reservation-service
+docker compose up --build      # or: npm run up
+```
+
+That builds the service, starts Postgres 17, waits until it is genuinely
+healthy, runs the migrations, and serves on <http://localhost:3000>. No Node
+installation, no `.env`, nothing else to configure:
+
+```bash
+curl localhost:3000/health
+# {"status":"ok","strategy":"optimistic"}
+```
+
+Postgres is still published on `:5433` for host tools, and the service reaches
+it over the compose network as `postgres:5432`.
+
+### Developing on the host
+
 Requires **Node >= 22.18** and Docker. (The service runs TypeScript directly —
 Node strips the types, so there is no build step. Type stripping is only
 unflagged from 22.18 onward.)
 
 ```bash
-git clone https://github.com/adoodevv/reservation-service.git
-cd reservation-service
-
 cp .env.example .env   # or export DATABASE_URL yourself -- see note below
 npm install
 npm run db:up          # Postgres 17 in Docker on :5433, waits until it answers
 npm run db:migrate
 npm start              # http://localhost:3000
 ```
+
+`npm run db:up` starts *only* Postgres, so the test and bench workflows below
+never wait on a container build.
 
 Nothing listens on 5432, so this will not collide with a Postgres you already
 run locally. `npm run db:reset` tears the volume down and rebuilds from scratch.

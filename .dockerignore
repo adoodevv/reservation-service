@@ -1,2 +1,7 @@
 node_modules
 .git
+# Never bake local credentials into an image.
+.env
+# Local stress-test scratch files.
+bench/_scratch
+coverage

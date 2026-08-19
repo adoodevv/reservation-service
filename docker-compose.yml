@@ -26,3 +26,24 @@ services:
     tmpfs:
       # Benchmarks should measure lock contention, not laptop disk fsync latency.
       - /var/lib/postgresql/data
+
+  app:
+    build: .
+    container_name: reservations-app
+    depends_on:
+      postgres:
+        # Not just "started": the service migrates before it listens, and a
+        # migration against a database still doing its own init crashes the
+        # container on the very first `docker compose up`.
+        condition: service_healthy
+    environment:
+      # `postgres` is the compose service name and 5432 its container port --
+      # the 5433 mapping below is for tools running on the host, not for this.
+      DATABASE_URL: postgres://reservations:reservations@postgres:5432/reservations
+      PORT: 3000
+      HOST: 0.0.0.0
+      PG_POOL_MAX: 32
+      ALLOCATION_STRATEGY: optimistic
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
