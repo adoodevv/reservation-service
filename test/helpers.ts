@@ -45,6 +45,22 @@ export async function countDoubleBookings(
    table: "reservations" | "naive_reservations" = "reservations",
 ): Promise<number> {
    const conflicts = await withTransaction((tx) => repo.findDoubleBookings(tx, table));
+   if (conflicts.length > 0 && table === "reservations") {
+      const { rows } = await pool.query(
+         `select a.xmin::text as inserting_xid, a.id, a.guest_ref, a.state::text,
+                 a.version, r.slug, a.unit_id,
+                 lower(a.period) lo, upper(a.period) hi, a.created_at, a.updated_at,
+                 (select json_agg(json_build_object('from', e.from_state::text,
+                                                    'to', e.to_state::text,
+                                                    'at', e.occurred_at,
+                                                    'detail', e.detail) order by e.id)
+                  from reservation_events e where e.reservation_id = a.id) as events
+          from reservations a join resources r on r.id = a.resource_id
+          where a.id = any($1::uuid[]) order by a.unit_id, a.created_at`,
+         [conflicts.flatMap((c) => [c.leftId, c.rightId])],
+      );
+      console.error("CONFLICT ROWS:", JSON.stringify(rows, null, 1));
+   }
    return conflicts.length;
 }
 

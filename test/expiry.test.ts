@@ -221,6 +221,11 @@ describe("hold expiry", () => {
             guestRef: `fresh-${i}`,
             period: window,
             maxRetries: 20,
+            // Explicitly long-lived. This test is about reclaiming the *stale*
+            // holds seeded above; leaving the fresh ones on the default TTL
+            // would let a slow run reclaim and resell them too, making the
+            // winner count depend on how long the machine took.
+            ttlSeconds: 3600,
          }),
       );
 
