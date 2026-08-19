@@ -70,15 +70,41 @@ export async function withTransaction<T>(
       await client.query(begin);
       const result = await fn(client);
       await client.query("commit");
+      client.release();
       return result;
    } catch (err) {
-      // Rollback can itself fail if the connection died mid-transaction; the
-      // original error is the interesting one, so swallow this.
-      await client.query("rollback").catch(() => {});
-      throw err;
-   } finally {
+      // A connection may only go back to the pool if we are certain its
+      // transaction is closed. If the ROLLBACK itself fails -- the connection
+      // died, or the rollback was cancelled -- we do not know that, and a
+      // client returned mid-transaction is silently poisonous: the next
+      // borrower's BEGIN is a no-op warning ("there is already a transaction in
+      // progress"), so its work joins the stale transaction and commits
+      // whatever that transaction was carrying.
+      //
+      // So on a failed rollback, destroy the connection instead. The pool opens
+      // a fresh one; the cost is one TCP handshake, and the alternative is
+      // cross-request corruption that is almost impossible to trace back here.
+      try {
+         await client.query("rollback");
+      } catch (rollbackErr) {
+         brokenConnections++;
+         console.error(
+            "[pg] ROLLBACK failed; discarding connection:",
+            (rollbackErr as Error).message,
+         );
+         client.release(rollbackErr as Error);
+         throw err;
+      }
       client.release();
+      throw err;
    }
+}
+
+/** Connections discarded because their transaction state was unknown. */
+export let brokenConnections = 0;
+
+export function resetBrokenConnections(): void {
+   brokenConnections = 0;
 }
 
 export async function closePool(): Promise<void> {
