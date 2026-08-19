@@ -240,6 +240,15 @@ export async function findFreeUnits(
    resourceId: string,
    period: Period,
    order: CandidateOrder = "random",
+   /**
+    * Units this caller has already collided with during the current allocation.
+    *
+    * A conflict is proof that the unit is taken by a transaction we could not
+    * see, so re-offering it wastes a retry. Excluding them makes each attempt
+    * strictly narrow the search instead of resampling the same contested
+    * inventory at random.
+    */
+   exclude: string[] = [],
    // Wide enough that random selection actually spreads a large burst across
    // free inventory. With a narrow candidate list, thousands of concurrent
    // requests pile onto a handful of units and manufacture conflicts that the
@@ -250,6 +259,7 @@ export async function findFreeUnits(
       `select u.id
        from resource_units u
        where u.resource_id = $1
+         and not (u.id = any($4::uuid[]))
          and not exists (
             select 1
             from reservations r
@@ -258,10 +268,39 @@ export async function findFreeUnits(
               and r.period && tstzrange($2::timestamptz, $3::timestamptz, '[)')
          )
        order by ${order === "random" ? "random()" : "u.label"}
-       limit $4`,
-      [resourceId, period.from, period.to, limit],
+       limit $5`,
+      [resourceId, period.from, period.to, exclude, limit],
    );
    return rows.map((r) => r.id);
+}
+
+/**
+ * Authoritative free-unit count, ignoring any per-attempt exclusions.
+ *
+ * Used once, on the failure path, to decide what to tell a caller whose retry
+ * budget ran out: a genuine sell-out ("stop") or lost races against inventory
+ * that still exists ("try again"). Those need different status codes, and the
+ * retry loop alone cannot tell them apart.
+ */
+export async function countFreeUnits(
+   tx: Executor,
+   resourceId: string,
+   period: Period,
+): Promise<number> {
+   const { rows } = await tx.query<{ n: number }>(
+      `select count(*)::int as n
+       from resource_units u
+       where u.resource_id = $1
+         and not exists (
+            select 1
+            from reservations r
+            where r.unit_id = u.id
+              and r.state in ('held', 'confirmed')
+              and r.period && tstzrange($2::timestamptz, $3::timestamptz, '[)')
+         )`,
+      [resourceId, period.from, period.to],
+   );
+   return rows[0]?.n ?? 0;
 }
 
 /**

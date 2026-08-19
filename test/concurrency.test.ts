@@ -17,7 +17,7 @@
  *               books 47 of 50 rooms under load is broken too, just quietly.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { closePool, withTransaction } from "../src/db/pool.ts";
+import { closePool, pool, withTransaction } from "../src/db/pool.ts";
 import { NoInventoryError, ServiceError } from "../src/domain/errors.ts";
 import type { AllocationOutcome } from "../src/domain/types.ts";
 import * as repo from "../src/repo/reservations.ts";
@@ -201,6 +201,138 @@ describe("concurrent allocation", () => {
       expect(new Set(ok.map((o: AllocationOutcome) => o.reservation.unitId)).size).toBe(
          ok.length,
       );
+   });
+
+   it("a lost race must never be reported as sold out", async () => {
+      // Regression test. The allocator narrows its search by excluding units it
+      // has already collided with, which is what lets a large burst converge
+      // instead of resampling contested inventory until its budget runs out.
+      //
+      // But a conflict is not proof that inventory is gone -- the winner may
+      // roll back, its hold may expire, or the failure may have been a
+      // serialization abort that says nothing about the unit at all. An earlier
+      // version let an empty *filtered* candidate list stand in for an empty
+      // one, and on a single unit both contenders excluded it and both reported
+      // "sold out": a booking lost to inventory that was sitting right there.
+      //
+      // With one unit and two racing requests, exactly one must win. Always.
+      for (const strategy of SAFE_STRATEGIES) {
+         await truncateAll();
+         const resource = await seedResource(1, `no-false-soldout-${strategy}`);
+
+         const results = await stampede(2, (i) =>
+            allocate({
+               resourceId: resource.id,
+               guestRef: `guest-${i}`,
+               period: period(),
+               strategy,
+            }),
+         );
+
+         const { ok, failed } = partition(results);
+         expect(ok, `${strategy}: exactly one request must win`).toHaveLength(1);
+         expect(failed[0], `${strategy}: the loser must be told sold out`).toBeInstanceOf(
+            NoInventoryError,
+         );
+         expect(await countDoubleBookings()).toBe(0);
+      }
+   });
+
+   it("will not call it sold out while the only conflict is uncommitted", async () => {
+      // Deterministic reproduction of the bug the test above can only catch by
+      // luck. A blocking transaction is held open for the duration, so the
+      // conflict is guaranteed rather than raced.
+      //
+      // The allocator excludes units it has collided with, to make large bursts
+      // converge. If that exclusion is allowed to empty the candidate list and
+      // stand in for "no inventory", the caller is told the resource is sold
+      // out -- when in truth the only thing in the way is a transaction that
+      // has not committed and may yet roll back. Inventory would be silently
+      // lost on a rollback.
+      //
+      // The honest answer here is "contended, try again", not "sold out".
+      const resource = await seedResource(1, "uncommitted-conflict");
+      const window = period();
+      const units = await withTransaction((tx) => repo.listUnits(tx, resource.id));
+      const unitId = units[0]!.id;
+
+      const blocker = await pool.connect();
+      try {
+         await blocker.query("begin");
+         await blocker.query(
+            `insert into reservations
+                (unit_id, resource_id, guest_ref, state, period, hold_expires_at)
+             values ($1, $2, 'blocker', 'held',
+                     tstzrange($3::timestamptz, $4::timestamptz, '[)'),
+                     now() + interval '1 hour')`,
+            [unitId, resource.id, window.from, window.to],
+         );
+         // Deliberately not committed: invisible to READ COMMITTED readers,
+         // but it holds the exclusion index entry for this key range.
+
+         await expect(
+            allocate({
+               resourceId: resource.id,
+               guestRef: "contender",
+               period: window,
+               maxRetries: 3,
+            }),
+         ).rejects.toMatchObject({ code: "exhausted_retries" });
+      } finally {
+         await blocker.query("rollback").catch(() => {});
+         blocker.release();
+      }
+
+      // And once the blocker rolls back, the unit was never gone.
+      const after = await allocate({
+         resourceId: resource.id,
+         guestRef: "later",
+         period: window,
+      });
+      expect(after.reservation.unitId).toBe(unitId);
+      expect(await countDoubleBookings()).toBe(0);
+   });
+
+   it("tells a loser 'sold out', not 'try again', once inventory is gone", async () => {
+      // The distinction matters operationally: `exhausted_retries` maps to 503
+      // with Retry-After, inviting the client back. Returning that to someone
+      // facing a genuinely sold-out resource adds load at the exact moment the
+      // system has none to spare. A caller that ran out of retries against
+      // exhausted inventory must still get the truthful terminal answer.
+      const capacity = 5;
+      const resource = await seedResource(capacity, "truthful-soldout");
+      const window = period();
+
+      // Fill capacity first and let it commit. The contenders below then start
+      // against inventory that is *definitively* gone, so "sold out" is the
+      // only truthful answer any of them can receive. Racing the fill would
+      // make `exhausted_retries` legitimate for whoever finished early, which
+      // is a different (and correct) behaviour that this test is not about.
+      for (let i = 0; i < capacity; i++) {
+         await allocate({
+            resourceId: resource.id,
+            guestRef: `filler-${i}`,
+            period: window,
+            ttlSeconds: 3600,
+         });
+      }
+
+      const results = await stampede(200, (i) =>
+         allocate({
+            resourceId: resource.id,
+            guestRef: `guest-${i}`,
+            period: window,
+            // A deliberately tiny budget: none of these can resolve the
+            // situation by retrying, so the final authoritative check is what
+            // has to produce the right answer.
+            maxRetries: 1,
+         }),
+      );
+
+      const { ok, failed } = partition(results);
+      expect(ok).toHaveLength(0);
+      expect(await countDoubleBookings()).toBe(0);
+      expect(summarise(failed)).toEqual({ no_inventory: 200 });
    });
 
    it("non-overlapping windows never contend: all 100 succeed on one unit", async () => {

@@ -3,3 +3,4 @@ node_modules/
 *.log
 coverage/
 bench/results/*.json
+bench/_scratch/

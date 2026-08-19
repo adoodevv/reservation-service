@@ -113,6 +113,18 @@ export function isLockTimeout(err: unknown): boolean {
 }
 
 /**
+ * True when the server ran out of time or memory executing our statement.
+ *
+ * Both mean the transaction did no work and is gone, so retrying is safe --
+ * and necessary: left uncaught these surface as HTTP 500s, when the honest
+ * answer is either "sold out" or "overloaded, try again".
+ */
+export function isOverloadError(err: unknown): boolean {
+   const state = sqlState(err);
+   return state === PG_STATEMENT_TIMEOUT || state === PG_OUT_OF_SHARED_MEMORY;
+}
+
+/**
  * True for failures that mean "the system is past its capacity right now"
  * rather than "this request is wrong". None of them can corrupt state -- the
  * transaction is gone -- so they are availability events, not safety events,
