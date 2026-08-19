@@ -37,6 +37,54 @@ differ on yours; the double-booking column will not.</sub>
 
 ---
 
+## How it works, in one picture
+
+The whole service is a retry loop wrapped around a race it *expects* to lose.
+Safety lives in the constraint at the bottom, not in any of the application
+logic above it — everything else exists to turn a lost race into a truthful
+answer.
+
+```mermaid
+flowchart TD
+    REQ["POST /v1/holds"] --> LOOP{"retry loop — attempt ≤ maxRetries"}
+
+    LOOP --> FIND["findFreeUnits()<br/><i>minus units already collided with</i>"]
+    FIND -->|"no candidates"| RECLAIM["reclaim expired holds"]
+    RECLAIM -->|"none reclaimed"| SOLDOUT(["409 no_inventory"])
+    RECLAIM -->|"freed some"| PICK
+    FIND -->|"candidates"| PICK["pick one at random"]
+
+    PICK --> INSERT["INSERT hold"]
+    INSERT --> EXCL{"EXCLUDE constraint<br/><b>the safety boundary</b>"}
+
+    EXCL -->|"accepted"| WIN(["201 reservation"])
+    EXCL -->|"23P01 / 55P03<br/>someone else won"| MARK["mark unit collided,<br/>jittered backoff"]
+    MARK --> LOOP
+
+    LOOP -->|"budget exhausted"| RECOUNT["authoritative recount<br/><i>no exclusions, after reclaim</i>"]
+    RECOUNT -->|"0 free"| SOLDOUT
+    RECOUNT -->|"some free"| RETRY(["503 exhausted_retries<br/>+ Retry-After"])
+
+    style EXCL fill:#1f6feb,stroke:#1f6feb,color:#fff
+    style WIN fill:#238636,stroke:#238636,color:#fff
+    style SOLDOUT fill:#9e6a03,stroke:#9e6a03,color:#fff
+    style RETRY fill:#9e6a03,stroke:#9e6a03,color:#fff
+```
+
+Three things in that diagram are the entire design:
+
+- **The blue box is the only thing enforcing safety.** Every path to a booking
+  goes through it, and it is a database constraint — so no application bug, no
+  absent retry, and no future caller can route around it.
+- **A collision is expected, not exceptional.** Losing to `23P01` means the
+  constraint did its job. The loser records which unit beat it and narrows its
+  next search, rather than resampling contested inventory at random.
+- **Running out of retries is not the same as running out of rooms.** They
+  deserve different status codes, and the loop cannot tell them apart from the
+  inside — hence the authoritative recount before answering.
+
+---
+
 ## The problem
 
 A reservation system's core invariant is one sentence:
@@ -236,20 +284,42 @@ the smoke detector's test button.
 
 ## Running it
 
+### Everything in one command
+
+```bash
+git clone https://github.com/adoodevv/reservation-service.git
+cd reservation-service
+docker compose up --build      # or: npm run up
+```
+
+That builds the service, starts Postgres 17, waits until it is genuinely
+healthy, runs the migrations, and serves on <http://localhost:3000>. No Node
+installation, no `.env`, nothing else to configure:
+
+```bash
+curl localhost:3000/health
+# {"status":"ok","strategy":"optimistic"}
+```
+
+Postgres is still published on `:5433` for host tools, and the service reaches
+it over the compose network as `postgres:5432`.
+
+### Developing on the host
+
 Requires **Node >= 22.18** and Docker. (The service runs TypeScript directly —
 Node strips the types, so there is no build step. Type stripping is only
 unflagged from 22.18 onward.)
 
 ```bash
-git clone https://github.com/adoodevv/reservation-service.git
-cd reservation-service
-
 cp .env.example .env   # or export DATABASE_URL yourself -- see note below
 npm install
 npm run db:up          # Postgres 17 in Docker on :5433, waits until it answers
 npm run db:migrate
 npm start              # http://localhost:3000
 ```
+
+`npm run db:up` starts *only* Postgres, so the test and bench workflows below
+never wait on a container build.
 
 Nothing listens on 5432, so this will not collide with a Postgres you already
 run locally. `npm run db:reset` tears the volume down and rebuilds from scratch.
