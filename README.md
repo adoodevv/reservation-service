@@ -37,6 +37,54 @@ differ on yours; the double-booking column will not.</sub>
 
 ---
 
+## How it works, in one picture
+
+The whole service is a retry loop wrapped around a race it *expects* to lose.
+Safety lives in the constraint at the bottom, not in any of the application
+logic above it — everything else exists to turn a lost race into a truthful
+answer.
+
+```mermaid
+flowchart TD
+    REQ["POST /v1/holds"] --> LOOP{"retry loop — attempt ≤ maxRetries"}
+
+    LOOP --> FIND["findFreeUnits()<br/><i>minus units already collided with</i>"]
+    FIND -->|"no candidates"| RECLAIM["reclaim expired holds"]
+    RECLAIM -->|"none reclaimed"| SOLDOUT(["409 no_inventory"])
+    RECLAIM -->|"freed some"| PICK
+    FIND -->|"candidates"| PICK["pick one at random"]
+
+    PICK --> INSERT["INSERT hold"]
+    INSERT --> EXCL{"EXCLUDE constraint<br/><b>the safety boundary</b>"}
+
+    EXCL -->|"accepted"| WIN(["201 reservation"])
+    EXCL -->|"23P01 / 55P03<br/>someone else won"| MARK["mark unit collided,<br/>jittered backoff"]
+    MARK --> LOOP
+
+    LOOP -->|"budget exhausted"| RECOUNT["authoritative recount<br/><i>no exclusions, after reclaim</i>"]
+    RECOUNT -->|"0 free"| SOLDOUT
+    RECOUNT -->|"some free"| RETRY(["503 exhausted_retries<br/>+ Retry-After"])
+
+    style EXCL fill:#1f6feb,stroke:#1f6feb,color:#fff
+    style WIN fill:#238636,stroke:#238636,color:#fff
+    style SOLDOUT fill:#9e6a03,stroke:#9e6a03,color:#fff
+    style RETRY fill:#9e6a03,stroke:#9e6a03,color:#fff
+```
+
+Three things in that diagram are the entire design:
+
+- **The blue box is the only thing enforcing safety.** Every path to a booking
+  goes through it, and it is a database constraint — so no application bug, no
+  absent retry, and no future caller can route around it.
+- **A collision is expected, not exceptional.** Losing to `23P01` means the
+  constraint did its job. The loser records which unit beat it and narrows its
+  next search, rather than resampling contested inventory at random.
+- **Running out of retries is not the same as running out of rooms.** They
+  deserve different status codes, and the loop cannot tell them apart from the
+  inside — hence the authoritative recount before answering.
+
+---
+
 ## The problem
 
 A reservation system's core invariant is one sentence:
