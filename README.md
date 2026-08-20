@@ -204,7 +204,11 @@ All of this is configurable, because the comparison *is* the point:
 `pessimistic` uses `pg_advisory_xact_lock` rather than `SELECT ... FOR UPDATE` on
 the resource row: it is a mutex over *the act of allocating*, not a claim on
 resource metadata, so it does not block an unrelated rename, and it releases
-automatically on commit or rollback so a crashed backend cannot strand it.
+automatically on commit or rollback so a crashed backend cannot strand it. The
+`_xact_` half matters for deployment too: a transaction-scoped advisory lock is
+released with the transaction and so survives transaction-mode pooling
+(PgBouncer), whereas the session-scoped `pg_advisory_lock` would outlive the
+transaction and be handed to whichever client got that pooled session next.
 
 ### What the measurements actually showed
 
