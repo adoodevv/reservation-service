@@ -48,8 +48,10 @@ jobs:
 
       # A smaller load run than the README's, sized to finish on a CI runner
       # while still asserting zero double-bookings. `serializable` is left out
-      # here purely for wall time -- it dominates a full sweep under contention
-      # and its correctness is already covered by the test suite above.
+      # for two reasons: it dominates a full sweep under contention, and it is
+      # no longer in the tested-safe set at all -- a cancelled statement can
+      # leave it double-booking (see the README). There is no point spending CI
+      # minutes asserting an invariant that strategy is known to violate.
       - run: >-
           node bench/loadtest.ts
           --attempts 800 --units 50 --seed-resources 400
