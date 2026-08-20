@@ -437,3 +437,9 @@ bench/             load harness and generated RESULTS.md
 `src/repo` never opens its own transaction. Choosing the transaction and its
 isolation level is the allocator's entire job, and it cannot do that if the
 layer beneath it opens one first.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
