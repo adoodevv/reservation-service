@@ -12,11 +12,11 @@
  * meaningless.
  *
  *   npm run bench            -- run and print
- *   npm run report           -- run and write bench/RESULTS.md + update README
+ *   npm run report           -- run and write bench/RESULTS.md
  *   node --env-file=.env bench/loadtest.ts --attempts 5000 --units 200
  */
 import { parseArgs } from "node:util";
-import { writeFile, readFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { closePool, pool, withTransaction } from "../src/db/pool.ts";
@@ -446,27 +446,12 @@ if (values["write-report"]) {
       "",
    ].join("\n");
 
+   // RESULTS.md only. The README table is curated by hand from one canonical
+   // run: splicing it here meant every benchmark dirtied the working tree, and
+   // invited committing whichever machine happened to run last.
    const reportPath = join(HERE, "RESULTS.md");
    await writeFile(reportPath, report, "utf8");
    console.log(`wrote ${reportPath}`);
-
-   // Splice the table into the README between marker comments so the headline
-   // numbers there are always the ones the harness actually produced.
-   const readmePath = join(HERE, "..", "README.md");
-   try {
-      const readme = await readFile(readmePath, "utf8");
-      const start = "<!-- BENCH:START -->";
-      const end = "<!-- BENCH:END -->";
-      if (readme.includes(start) && readme.includes(end)) {
-         const before = readme.slice(0, readme.indexOf(start) + start.length);
-         const after = readme.slice(readme.indexOf(end));
-         const block = ["", verdict(results), "", resultsTable(results), ""].join("\n");
-         await writeFile(readmePath, `${before}${block}${after}`, "utf8");
-         console.log(`updated ${readmePath}`);
-      }
-   } catch {
-      // README not written yet; RESULTS.md still stands on its own.
-   }
 }
 
 await closePool();
