@@ -406,9 +406,15 @@ Two things worth knowing before you run it:
   numbers land in `bench/RESULTS.md` without dirtying the README or inviting a
   commit of machine-specific latencies.
 
-> If `npm run db:up` fails to pull the image with a `gpg`/credential error, that
-> is the host's Docker credential helper, not this project. `docker pull
-> postgres:17-alpine` with a clean `DOCKER_CONFIG` works around it.
+> If any Docker image pull fails with a `gpg`/credential error — `docker compose
+> up --build` fetching `node:22-alpine`, or `npm run db:up` fetching
+> `postgres:17-alpine` — that is the host's Docker credential helper, not this
+> project. Point Docker at an empty config for the command and it goes away:
+>
+> ```bash
+> mkdir -p /tmp/empty-docker-config
+> DOCKER_CONFIG=/tmp/empty-docker-config docker compose up --build
+> ```
 
 ---
 
