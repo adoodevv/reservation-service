@@ -308,6 +308,14 @@ constraint. If `naive` ever stops producing double-bookings, the harness has
 stopped generating real contention and every zero elsewhere is vacuous. It is
 the smoke detector's test button.
 
+That button is worth pressing honestly. On `last-room`, `naive` produced a
+single double-booking in 3,000 attempts — one unit gives a narrow window in
+which two check-then-inserts can interleave, so a near-zero there is a property
+of the scenario, not evidence of pressure. The control-group argument therefore
+rests on `full-house` (17,126) and `sliding-windows` (18,839), where the window
+is wide enough for the absence of a constraint to be unmistakable; read
+`last-room`'s control number as the weakest of the three, because it is.
+
 ---
 
 ## Running it
