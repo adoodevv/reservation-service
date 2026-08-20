@@ -219,7 +219,11 @@ conflicting uncommitted transaction it meets, and statements accumulate past
 `statement_timeout`. At 120 requests against 10 units: 97 of 120 died on SQLSTATE
 `57014`, and the run took 129s against 0.7s for `optimistic`. At 3,000 requests it
 also sheds requests to predicate-lock shared-memory exhaustion (`53200`), and on
-the sliding-window scenario it runs 86s against 7.9s for `optimistic`.
+the sliding-window scenario it runs 86s against 7.9s for `optimistic`. That row
+is worse than "slow" makes it sound: a p50 of 83.7s against an 86.2s wall means
+the median request was in flight for 97% of the entire run, so the requests were
+not sharing the database so much as queuing through it one at a time. That is
+near-total serialization — the isolation level's name taken literally.
 
 That was the whole story until the suite produced two `held` rows on one unit for
 the same nights. **`serializable` double-books.** Cancelling a statement while a
