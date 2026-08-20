@@ -34,7 +34,45 @@ import {
 } from "./helpers.ts";
 
 /** Every strategy that must never double-book. */
-const SAFE_STRATEGIES: AllocationStrategy[] = ["optimistic", "serializable", "pessimistic"];
+/**
+ * Strategies that must never double-book.
+ *
+ * `serializable` is deliberately NOT in this list; the note below is why, and
+ * it is not an omission.
+ */
+const SAFE_STRATEGIES: AllocationStrategy[] = ["optimistic", "pessimistic"];
+
+/**
+ * Strategies known to double-book, kept runnable so the load harness can
+ * demonstrate the failure rather than assert it.
+ *
+ * `naive` is wrong by construction: check-then-insert with no constraint.
+ *
+ * `serializable` is wrong for a subtler reason that took a while to pin down.
+ * Cancelling a statement -- `lock_timeout`, `statement_timeout`, a client
+ * disconnect, an admin `pg_cancel_backend` -- while a SERIALIZABLE transaction
+ * is inserting into the GiST exclusion index can leave a committed heap row
+ * with no matching index entry. Two things then follow, and the second is
+ * worse than the first:
+ *
+ *   1. The constraint stops working. It is enforced by an index scan, so a row
+ *      the index never recorded is a row nothing can conflict with, and the
+ *      next overlapping insert is admitted.
+ *   2. The check for it stops working, because find_double_bookings() used to
+ *      resolve `period && period` through that same index. On a table holding
+ *      four real violations it reported two.
+ *
+ * Reproduced on stock postgres:17-alpine (17.11) in pure SQL with no code from
+ * src/ involved: 60 concurrent SERIALIZABLE transactions over 10 units fail
+ * within ~10 rounds with a 150ms lock_timeout, and still fail with lock_timeout
+ * disabled and a 200ms statement_timeout. With no cancellation source at all
+ * they survived 160 rounds -- which is not a configuration anything can
+ * actually run in.
+ *
+ * SERIALIZABLE was never buying safety here anyway: the exclusion constraint
+ * provides that, and SSI is layered on top. It bought a truthful "sold out",
+ * at a cost the benchmarks already showed was steep.
+ */
 
 /**
  * Strategies exercised at full load.
@@ -176,31 +214,33 @@ describe("concurrent allocation", () => {
       });
    });
 
-   it("serializable stays correct at the load where it stops being available", async () => {
-      // SERIALIZABLE's problem in this service is throughput, not safety. Even
-      // when most requests are shed, the ones that land must still respect
-      // capacity -- it must never oversell to compensate.
-      const capacity = 10;
-      const resource = await seedResource(capacity, "serializable-correctness");
-      const window = period();
-
-      const results = await stampede(60, (i) =>
-         allocate({
-            resourceId: resource.id,
-            guestRef: `guest-${i}`,
-            period: window,
-            strategy: "serializable",
-            maxRetries: 10,
-         }),
+   it("the double-booking check cannot be fooled by the index it checks", async () => {
+      // The verifier is the entire evidence base of this project: nothing here
+      // asks the service whether it double-booked, it asks the database. That
+      // is only worth anything if the check can actually see a violation.
+      //
+      // It could not. The planner resolved `a.period && b.period` with an index
+      // scan over reservations_no_overlap -- the exclusion index itself -- so
+      // the verifier asked the broken index whether the index was broken. On a
+      // table holding four genuine overlaps it reported two.
+      //
+      // 004_trustworthy_verifier pins the planner off index scans for these two
+      // functions. Asserting on proconfig rather than on a captured plan keeps
+      // this stable: the plan shape depends on table statistics, the guarantee
+      // does not.
+      const { rows } = await pool.query<{ proname: string; proconfig: string[] | null }>(
+         `select proname, proconfig from pg_proc
+          where proname in ('find_double_bookings', 'find_naive_double_bookings')
+          order by proname`,
       );
-
-      const { ok } = partition(results);
-      expect(await countDoubleBookings()).toBe(0);
-      // Never more than capacity. Possibly fewer, if requests were shed.
-      expect(ok.length).toBeLessThanOrEqual(capacity);
-      expect(new Set(ok.map((o: AllocationOutcome) => o.reservation.unitId)).size).toBe(
-         ok.length,
-      );
+      expect(rows).toHaveLength(2);
+      for (const fn of rows) {
+         expect(fn.proconfig, `${fn.proname} must pin the planner`).toContain(
+            "enable_indexscan=off",
+         );
+         expect(fn.proconfig).toContain("enable_bitmapscan=off");
+         expect(fn.proconfig).toContain("enable_indexonlyscan=off");
+      }
    });
 
    it("a lost race must never be reported as sold out", async () => {

@@ -35,6 +35,14 @@ Control group: the same harness, run against a table with the exclusion constrai
 Docker, 32-connection pool). Absolute latencies are hardware-bound and will
 differ on yours; the double-booking column will not.</sub>
 
+<sub>⚠️ The `serializable` rows above were measured before
+`004_trustworthy_verifier.sql`, with a checker that could not see the failure
+mode `serializable` actually has, and their zeros should not be read as evidence
+of safety — see [what the measurements actually
+showed](#what-the-measurements-actually-showed). The `optimistic`, `pessimistic`
+and `naive` rows are unaffected: their behaviour does not depend on the index the
+old checker was blind to, and re-running reproduces them.</sub>
+
 ---
 
 ## How it works, in one picture
@@ -190,7 +198,7 @@ All of this is configurable, because the comparison *is* the point:
 | --- | --- | --- |
 | `optimistic` (default) | READ COMMITTED | Pick, insert, let the constraint referee. Retry on `23P01`. |
 | `pessimistic` | READ COMMITTED | Per-resource advisory lock serialises allocation. Zero conflicts by construction. |
-| `serializable` | SERIALIZABLE | Same body; SSI also guarantees the read was consistent. Retry on `40001`. |
+| `serializable` | SERIALIZABLE | Same body; SSI also guarantees the read was consistent. Retry on `40001`. **Unsafe here — see below.** |
 | `naive` | READ COMMITTED | Check-then-insert against a table with no constraint. **Intentionally broken.** |
 
 `pessimistic` uses `pg_advisory_xact_lock` rather than `SELECT ... FOR UPDATE` on
@@ -200,19 +208,50 @@ automatically on commit or rollback so a crashed backend cannot strand it.
 
 ### What the measurements actually showed
 
-Three findings that were not obvious before running the harness, each of which
-changed the implementation:
+Findings that were not obvious before running the harness, each of which changed
+the implementation:
 
-**SERIALIZABLE adds no safety here, and costs availability.** The exclusion
-constraint already provides the guarantee; SSI is layered on top of it. Under
-high contention its aborts multiply the population of in-flight transactions on
-the same key range, each INSERT then waits out every conflicting uncommitted
-transaction it meets, and statements accumulate past `statement_timeout`. At
-120 requests against 10 units: 97 of 120 died on SQLSTATE `57014`, and the run
-took 129s against 0.7s for `optimistic`. At 3,000 requests it also sheds requests to
-predicate-lock shared-memory exhaustion (`53200`), and on the sliding-window
-scenario it runs 86s against 7.9s for `optimistic`. It never oversold — the failure
-mode is availability, not correctness.
+**SERIALIZABLE adds no safety here, costs availability — and then takes safety
+away.** The exclusion constraint already provides the guarantee; SSI is layered
+on top of it. Under high contention its aborts multiply the population of
+in-flight transactions on the same key range, each INSERT then waits out every
+conflicting uncommitted transaction it meets, and statements accumulate past
+`statement_timeout`. At 120 requests against 10 units: 97 of 120 died on SQLSTATE
+`57014`, and the run took 129s against 0.7s for `optimistic`. At 3,000 requests it
+also sheds requests to predicate-lock shared-memory exhaustion (`53200`), and on
+the sliding-window scenario it runs 86s against 7.9s for `optimistic`.
+
+That was the whole story until the suite produced two `held` rows on one unit for
+the same nights. **`serializable` double-books.** Cancelling a statement while a
+SERIALIZABLE transaction is inserting into the GiST exclusion index can leave a
+committed heap row with no matching index entry, and the constraint is enforced
+*by an index scan* — so that row is invisible to it and the next overlapping
+insert is admitted. `REINDEX` then refuses to rebuild the index at all, which is
+what a heap holding rows the index never recorded looks like.
+
+Any cancellation source triggers it: `lock_timeout`, `statement_timeout`, a
+dropped client, `pg_cancel_backend`. Reproduced on stock `postgres:17-alpine`
+(17.11) in pure SQL with none of `src/` involved — 60 concurrent SERIALIZABLE
+transactions over 10 units fail within ~10 rounds at a 150ms `lock_timeout`, and
+still fail with `lock_timeout` disabled and a 200ms `statement_timeout`. Only
+with no cancellation source whatsoever did 160 rounds survive, and that is not a
+configuration anything can run in. `optimistic` and `pessimistic`, which set the
+same timeouts, stayed clean across 320 rounds.
+
+`serializable` is therefore no longer in the tested-safe set. Little is lost:
+safety never came from the isolation level, it came from the constraint. What
+SERIALIZABLE bought was a *truthful* "sold out" rather than a merely current
+one, and the allocator now gets that from an authoritative recount at the end of
+its retry loop, far more cheaply.
+
+**A verifier must not share a failure mode with the thing it verifies.** This one
+did, and it is the most uncomfortable finding here. `find_double_bookings()`
+resolved `period && period` through `reservations_no_overlap` — the exclusion
+index itself. So the check for "did the index fail?" was answered *by the index*.
+On a table holding four genuine violations it reported two; forcing a sequential
+scan over the same rows returned all four. The function now pins the planner off
+index scans (`004_trustworthy_verifier.sql`), which is the only reason the
+numbers below can be read as evidence at all.
 
 **Benchmarking on a small table measures the wrong thing.** On a 20-row
 `reservations` table the planner seq-scans, and under SERIALIZABLE a seq scan

@@ -3,8 +3,9 @@
  * into exactly one reservation row, under arbitrary concurrency.
  *
  * Four strategies are implemented against the same interface so they can be run
- * head-to-head by bench/loadtest.ts. Three are correct and differ only in cost;
- * the fourth is wrong on purpose.
+ * head-to-head by bench/loadtest.ts. Two are correct and differ only in cost.
+ * The other two double-book: `naive` by construction, and `serializable` for a
+ * reason that had to be measured to be believed -- see below.
  *
  *   optimistic    READ COMMITTED. Pick a free unit, insert, and let the
  *                 exclusion constraint referee. Retry on 23P01. No locks held
@@ -13,10 +14,24 @@
  *
  *   serializable  SERIALIZABLE. Same body, but Postgres also guarantees the
  *                 read ("which units are free") was consistent with some serial
- *                 order. Retry on 40001/40P01. Note that the *safety* property
- *                 does not come from this isolation level -- the constraint
- *                 already provides it. What SERIALIZABLE buys is that a
- *                 "sold out" answer is truthful rather than merely current.
+ *                 order. Retry on 40001/40P01.
+ *
+ *                 UNSAFE HERE -- do not use it. Cancelling a statement while a
+ *                 SERIALIZABLE transaction inserts into the GiST exclusion
+ *                 index can leave a committed heap row with no index entry.
+ *                 The constraint is enforced by an index scan, so that row is
+ *                 invisible to it and the next overlapping insert is admitted.
+ *                 Any cancellation source does it: lock_timeout,
+ *                 statement_timeout, a dropped client, pg_cancel_backend.
+ *                 Reproduced on postgres:17-alpine (17.11) in pure SQL with
+ *                 none of this file involved.
+ *
+ *                 Note what is *not* lost by dropping it: safety never came
+ *                 from the isolation level, it came from the constraint. What
+ *                 SERIALIZABLE bought was a "sold out" answer that was
+ *                 truthful rather than merely current -- and the allocator now
+ *                 gets that from the authoritative recount at the end of the
+ *                 retry loop instead, at a fraction of the cost.
  *
  *   pessimistic   READ COMMITTED plus a per-resource advisory lock, which
  *                 serialises allocation for that resource. Zero conflicts by
